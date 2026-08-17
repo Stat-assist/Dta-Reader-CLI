@@ -9,10 +9,14 @@ syntax — **without needing a Stata license or installation**. Call it from Pyt
 with `subprocess`, parse the JSON, done. Or hand it straight to whatever database you're already
 using via `-e`.
 
-It is the CLI companion to Searchlight; the `.dta`
+It is the CLI companion to [Searchlight](https://github.com/YOUR-USERNAME/Searchlight); the `.dta`
 binary-decoding logic is a
 direct Rust port of that project's Java `core` engine, and covers `.dta` format versions **117–121**
-(Stata 13 through 19), both byte orders.
+(Stata 13 through 19) plus the legacy **114** and **115** (Stata 10 through 12), in both byte orders.
+
+The right parser is chosen by inspecting the file itself, not its extension or any flag: formats
+117–121 open with a `<stata_dta>` marker, while 114/115 open with a bare version byte. See
+[Legacy formats 114 and 115](#legacy-formats-114-and-115) for what differs.
 
 ---
 
@@ -277,6 +281,36 @@ to match Stata.
 
 ---
 
+## Legacy formats 114 and 115
+
+Formats 114 and 115 (Stata 10-12) are a different on-disk layout from the tag-based formats, not
+just an older version number of the same one. They have no `<stata_dta>`-style markers at all: just
+a fixed 109-byte header followed by sections whose sizes derive purely from the variable and
+observation counts, and their one-byte storage-type table outright conflicts with the modern
+two-byte one (the code `251` means `str251` under 117-121 but `byte` here). They also have no strL
+type, no alias variables, cap strings at `str244`, and store one byte per character rather than
+UTF-8.
+
+StataCorp documents 115 as "identical to format 114 except for the version number", so one code
+path serves both. 115 is the more common of the two in practice: Stata's own `saveold` emits it
+for `version(11)` and `version(12)` alike.
+
+None of that is visible from the outside: every command, flag, and `-e` export target works on a
+legacy file exactly as on any other, and `describe` reports the real `"release"` so you can tell
+what you opened. Notes and value labels come through too — these formats keep characteristics in
+"expansion fields" rather than a `<characteristics>` section, and the reader translates that.
+
+```sh
+searchlight_cli auto12.dta -c "describe"        # -> "release": 114
+searchlight_cli auto12.dta -e parquet -f out.parquet
+```
+
+Text is decoded as ISO-8859-1 rather than strict ASCII, so the high bytes that real pre-Unicode
+Stata files carry in labels are preserved rather than replaced with `?`.
+
+This tool is read-only, so there is no legacy-format writing to worry about here; the
+[Searchlight](https://github.com/YOUR-USERNAME/Searchlight) GUI does write 114/115 back out.
+
 ## Supported commands
 
 Each command produces one JSON object (the "envelope") with a `"command"` field plus the fields
@@ -402,9 +436,13 @@ Missing-value semantics follow Stata: missing is greater than every nonmissing n
   tools from MongoDB's Database Tools package: `bsondump` parses every document with correct types
   and correct missing-value handling; `mongorestore` accepts the file/metadata and proceeds to (and
   only fails at) the "no server reachable" step — i.e. it never rejects the file itself.
+- Legacy **formats 114 and 115** are tested against `auto12.dta` (a real format-114 file) and
+  `auto115.dta` (produced by Stata's own `saveold, version(12)`). Its metadata, storage types, value labels, `_dta` note, per-observation values,
+  missing-value decoding, and `summarize` statistics were all compared against Stata reading the
+  same file, and match exactly.
 - `cargo test` runs unit tests (number formatting, date rendering, `in`-range parsing, missing-value
-  ordering) and integration tests against a bundled `auto.dta` fixture, including all four export
-  formats.
+  ordering) and integration tests against bundled `auto.dta` (format 118) and `auto12.dta`
+  (format 114) fixtures, including all four export formats.
 
 ### Known scope limits
 
