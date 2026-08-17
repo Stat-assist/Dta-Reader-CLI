@@ -1,0 +1,23 @@
+[package]
+name = "searchlight_cli"
+version = "0.1.0"
+edition = "2021"
+description = "Read Stata .dta files and run a subset of Stata's inspection commands, emitting JSON/JSONL. No Stata installation required."
+
+# Core reader/commands are zero-dependency (std only). Export (-e flag) links rusqlite, duckdb
+# (bundled engine, no external tool needed), and bson. See THIRD_PARTY_LICENSES.md for their
+# licenses. This project's own code carries no license declaration.
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+duckdb = { version = "1", default-features = false, features = ["bundled", "parquet"] }
+bson = "2.11"
+
+[[bin]]
+name = "searchlight_cli"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

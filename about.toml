@@ -1,0 +1,29 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "ISC",
+    "CDLA-Permissive-2.0",
+]
+
+# Scoped to the platforms this tool actually ships on (per README's cross-platform promise), so
+# the license inventory reflects what's really compiled in, not platform-conditional crates (e.g.
+# Android/wasm-only deps pulled in transitively) that never build for any of our real targets.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# This is a "third-party" licenses file — exclude our own unpublished crate from its own listing.
+[private]
+ignore = true
