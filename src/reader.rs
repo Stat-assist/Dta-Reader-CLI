@@ -146,6 +146,10 @@ impl<'a> ByteReader<'a> {
     fn seek(&mut self, pos: usize) {
         self.pos = pos;
     }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
 }
 
 fn decode(raw: &[u8], utf8: bool) -> Result<String, String> {
@@ -162,8 +166,214 @@ fn trim_trailing_nul(s: &str) -> &str {
     s.strip_suffix('\0').unwrap_or(s)
 }
 
-/// Parse a whole .dta file image into a `Dataset`.
+/// Parse a whole .dta file image into a `Dataset`, dispatching on the file's layout.
+///
+/// The tag-based formats (117-121) open with the literal `<stata_dta>` marker; the legacy formats
+/// instead open with a bare `ds_format` byte holding the release number. Sniffing the marker keeps
+/// the two families cleanly separated -- their typlist encodings conflict outright, so guessing
+/// wrong would silently mis-type every variable rather than fail loudly.
 pub fn read_dta(data: &[u8], source_path: &str) -> Result<Dataset, String> {
+    const TAG_MAGIC: &[u8] = b"<stata_dta>";
+    if data.starts_with(TAG_MAGIC) {
+        return read_tag_dta(data, source_path);
+    }
+    match data.first() {
+        Some(&114) | Some(&115) => read_legacy_dta(data, source_path),
+        Some(&other) => Err(format!(
+            "Not a supported .dta file: expected the <stata_dta> marker of formats 117-121, or a \
+             legacy format-114/115 header, but the first byte is {} (0x{:02x})",
+            other, other
+        )),
+        None => Err("Not a .dta file: the file is empty".to_string()),
+    }
+}
+
+/// Parse a legacy, non-tag-based .dta file (formats 114 and 115, per dta_114).
+///
+/// Unlike the tag-based formats there are no markers to resynchronize on: the whole file is a
+/// fixed 109-byte header followed by sections whose sizes are derived purely from `nvar`/`nobs`
+/// and the typlist. The value-label section at the end is byte-for-byte the same structure the
+/// tag-based formats wrap in `<lbl>`, so that logic mirrors `read_tag_dta`'s.
+fn read_legacy_dta(data: &[u8], source_path: &str) -> Result<Dataset, String> {
+    let mut r = ByteReader::new(data);
+
+    // ---- header: a fixed 109-byte block (dta_114 section 5.1) ----
+    let release = r.u8()? as u16;
+    let version = DtaVersion::from_release(release)?;
+
+    // 0x01 = HILO (most-significant byte first), 0x02 = LOHI. Note this is the inverse spelling of
+    // the tag formats' "MSF"/"LSF" strings but means the same thing.
+    r.big_endian = match r.u8()? {
+        1 => true,
+        2 => false,
+        other => {
+            return Err(format!(
+                "Invalid format-114 byteorder byte 0x{:02x} (expected 0x01 HILO or 0x02 LOHI)",
+                other
+            ))
+        }
+    };
+    let _filetype = r.u8()?; // documented as always 0x01
+    let _unused = r.u8()?;
+    let k = r.u16()? as usize; // nvar
+    let n = r.u32()? as usize; // nobs
+    let dataset_label = r.fixed_string(81, version.utf8)?;
+    let timestamp = r.fixed_string(18, version.utf8)?;
+
+    // ---- descriptors (section 5.2) ----
+    let mut types: Vec<VarType> = Vec::with_capacity(k);
+    for _ in 0..k {
+        types.push(VarType::from_legacy_type_code(r.u8()?)?);
+    }
+
+    let mut names: Vec<String> = Vec::with_capacity(k);
+    for _ in 0..k {
+        names.push(r.fixed_string(version.varname_width, version.utf8)?);
+    }
+
+    // srtlist: k+1 two-byte entries holding 1-based variable numbers, terminated by a 0; whatever
+    // follows the terminator is documented junk.
+    let mut sort_order: Vec<usize> = Vec::new();
+    let mut saw_terminator = false;
+    for _ in 0..(k + 1) {
+        let v = r.u16()?;
+        if saw_terminator {
+            continue;
+        }
+        if v == 0 {
+            saw_terminator = true;
+        } else {
+            sort_order.push((v - 1) as usize);
+        }
+    }
+
+    let mut formats: Vec<String> = Vec::with_capacity(k);
+    for _ in 0..k {
+        formats.push(r.fixed_string(version.format_width, version.utf8)?);
+    }
+
+    let mut vl_names: Vec<String> = Vec::with_capacity(k);
+    for _ in 0..k {
+        vl_names.push(r.fixed_string(version.value_label_name_width, version.utf8)?);
+    }
+
+    // ---- variable labels (section 5.3) ----
+    let mut var_labels: Vec<String> = Vec::with_capacity(k);
+    for _ in 0..k {
+        var_labels.push(r.fixed_string(version.variable_label_width, version.utf8)?);
+    }
+
+    // ---- expansion fields (section 5.4) ----
+    // A chain of {u8 data_type, u32 len, len bytes}, ending at a 5-byte all-zero record. Only
+    // type 1 (a variable characteristic) is defined; anything else is skipped by length.
+    let mut characteristics: Vec<Characteristic> = Vec::new();
+    loop {
+        if r.remaining() < 5 {
+            break; // tolerate a file that simply stops here rather than erroring
+        }
+        let data_type = r.u8()?;
+        let len = r.u32()? as usize;
+        if data_type == 0 && len == 0 {
+            break;
+        }
+        let raw = r.bytes(len)?;
+        let name_width = version.characteristic_name_width;
+        if data_type == 1 && len >= 2 * name_width {
+            let varname = decode_fixed(&raw[..name_width], version.utf8)?;
+            let charname = decode_fixed(&raw[name_width..2 * name_width], version.utf8)?;
+            let contents =
+                trim_trailing_nul(&decode(&raw[2 * name_width..], version.utf8)?).to_string();
+            characteristics.push(Characteristic {
+                varname,
+                charname,
+                contents,
+            });
+        }
+    }
+
+    // ---- data (section 5.5) ----
+    let mut columns: Vec<Vec<Value>> = vec![Vec::with_capacity(n); k];
+    for _row in 0..n {
+        for col in 0..k {
+            match &types[col] {
+                VarType::Str(w) => {
+                    columns[col].push(Value::Text(r.fixed_string(*w as usize, version.utf8)?));
+                }
+                // 114 has no strL or alias types, so every remaining case is numeric.
+                numeric => columns[col].push(Value::Num(read_numeric(&mut r, numeric)?)),
+            }
+        }
+    }
+
+    // ---- value labels (section 5.6) ----
+    // These simply run to end-of-file; the file is equally valid ending right after the data.
+    // 40 bytes is the smallest possible label header (4 len + 33 name + 3 padding).
+    let mut value_labels: Vec<ValueLabel> = Vec::new();
+    while r.remaining() >= 40 {
+        let table_len = r.u32()? as usize;
+        let label_name = r.fixed_string(version.value_label_name_width, version.utf8)?;
+        r.bytes(3)?; // padding
+        let table_end = r.pos + table_len;
+        let entry_count = r.u32()? as usize;
+        let txt_len = r.u32()? as usize;
+        let mut off = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            off.push(r.u32()? as usize);
+        }
+        let mut val = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            val.push(r.i32()?);
+        }
+        let txt = r.bytes(txt_len)?.to_vec();
+        let mut label = ValueLabel::new(label_name);
+        for i in 0..entry_count {
+            let start = off[i];
+            let mut end = start;
+            while end < txt.len() && txt[end] != 0 {
+                end += 1;
+            }
+            if start <= txt.len() {
+                label
+                    .entries
+                    .insert(val[i], decode(&txt[start..end], version.utf8)?);
+            }
+        }
+        value_labels.push(label);
+        r.seek(table_end);
+    }
+
+    let variables: Vec<Variable> = (0..k)
+        .map(|i| Variable {
+            name: std::mem::take(&mut names[i]),
+            vtype: types[i].clone(),
+            format: std::mem::take(&mut formats[i]),
+            value_label_name: std::mem::take(&mut vl_names[i]),
+            label: std::mem::take(&mut var_labels[i]),
+        })
+        .collect();
+
+    Ok(Dataset {
+        variables,
+        columns,
+        nobs: n,
+        dataset_label,
+        timestamp,
+        sort_order,
+        source_release: release,
+        value_labels,
+        characteristics,
+        source_path: source_path.to_string(),
+    })
+}
+
+/// Decode a fixed-width, NUL-terminated field that has already been sliced out of a buffer.
+fn decode_fixed(raw: &[u8], utf8: bool) -> Result<String, String> {
+    let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    decode(&raw[..len], utf8)
+}
+
+/// Parse a tag-based .dta file image (formats 117-121) into a `Dataset`.
+fn read_tag_dta(data: &[u8], source_path: &str) -> Result<Dataset, String> {
     let mut r = ByteReader::new(data);
     r.expect_tag("<stata_dta>")?;
     r.expect_tag("<header>")?;
