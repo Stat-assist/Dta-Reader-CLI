@@ -9,7 +9,7 @@ syntax — **without needing a Stata license or installation**. Call it from Pyt
 with `subprocess`, parse the JSON, done. Or hand it straight to whatever database you're already
 using via `-e`.
 
-It is the CLI companion to [Searchlight](https://github.com/YOUR-USERNAME/Searchlight); the `.dta`
+It is the CLI companion to Searchlight; the `.dta`
 binary-decoding logic is a
 direct Rust port of that project's Java `core` engine, and covers `.dta` format versions **117–121**
 (Stata 13 through 19), both byte orders.
