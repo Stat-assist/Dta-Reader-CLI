@@ -37,6 +37,28 @@ impl VarType {
         })
     }
 
+    /// The legacy (format 114) typlist encoding, which is a completely different one-byte table
+    /// from the tag-based formats' two-byte codes: str1..str244 are 1..244, then byte/int/long/
+    /// float/double are 251..255 (dta_114 section 5.2). Note the tables genuinely conflict -- 251
+    /// means `str251` under the 117+ table but `byte` here -- so the two must never be mixed.
+    /// There is no strL or alias type in 114.
+    pub fn from_legacy_type_code(code: u8) -> Result<VarType, String> {
+        Ok(match code {
+            1..=244 => VarType::Str(code as u16),
+            251 => VarType::Byte,
+            252 => VarType::Int,
+            253 => VarType::Long,
+            254 => VarType::Float,
+            255 => VarType::Double,
+            other => {
+                return Err(format!(
+                    "Unknown format-114 variable type code: {} (expected 1-244 for str, or 251-255)",
+                    other
+                ))
+            }
+        })
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
@@ -90,6 +112,16 @@ impl DtaVersion {
         // release, kW, nW, dsLabelLenW, varnameW, formatW, vlNameW, varLabelW, charNameW,
         // dataVoVW, dataVoOW, gsoVW, gsoOW, utf8
         let v = match release {
+            // 114/115 are the legacy, non-tag-based layout (dta_114). Their dataset label is a
+            // fixed 81-byte field rather than a length-prefixed one, and they have no strL/GSO
+            // section, so dataset_label_len_width and the four (v,o)/GSO widths are 0 = "not
+            // applicable here". StataCorp: "Format 114 is identical to format 115 except for the
+            // version number" -- 115 exists only to stop older Statas opening files that might use
+            // the then-new %tb business-date formats -- so one code path serves both. Note Stata's
+            // own `saveold, version(11)` and `version(12)` both emit 115, making it the legacy
+            // format most files in the wild actually use.
+            114 => DtaVersion::new(114, 2, 4, 0, 33, 49, 33, 81, 33, 0, 0, 0, 0, false),
+            115 => DtaVersion::new(115, 2, 4, 0, 33, 49, 33, 81, 33, 0, 0, 0, 0, false),
             117 => DtaVersion::new(117, 2, 4, 1, 33, 49, 33, 81, 33, 4, 4, 4, 4, false),
             118 => DtaVersion::new(118, 2, 8, 2, 129, 57, 129, 321, 129, 2, 6, 4, 8, true),
             119 => DtaVersion::new(119, 4, 8, 2, 129, 57, 129, 321, 129, 3, 5, 4, 8, true),
@@ -98,6 +130,11 @@ impl DtaVersion {
             other => return Err(format!("Unsupported .dta format release: {}", other)),
         };
         Ok(v)
+    }
+
+    /// True for the pre-117 layouts (fixed-offset header, one-byte typlist codes, no tags).
+    pub fn is_legacy(&self) -> bool {
+        self.release < 117
     }
 
     #[allow(clippy::too_many_arguments)]
